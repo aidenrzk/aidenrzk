@@ -1,0 +1,87 @@
+name: CI Pipeline
+
+on:
+  - push
+  - pull_request
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.runtime }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime:
+          - stable
+          - oldstable
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.runtime }}
+          cache: ${{ hashFiles('go.mod') != '' && 'go.mod' || '' }}
+
+      - name: Install dependencies
+        if: hashFiles('go.mod') != ''
+        run: go mod download
+
+      - name: Check formatting
+        if: hashFiles('go.mod') != ''
+        run: |
+          if ! test -z "$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))"; then
+            echo "Go files are not gofmt-formatted."
+            exit 1
+          fi
+
+      - name: Run lint checks
+        if: hashFiles('go.mod') != ''
+        run: go vet ./...
+
+      - name: Build package
+        if: hashFiles('go.mod') != ''
+        run: go build ./...
+
+      - name: Run tests
+        if: hashFiles('go.mod') != ''
+        run: go test ./...
+
+      - name: Summarize pipeline
+        if: always()
+        env:
+          CHECK_FORMATTING_OUTCOME: ${{ steps.check-formatting.outcome }}
+          LINT_OUTCOME: ${{ steps.lint-checks.outcome }}
+          BUILD_OUTCOME: ${{ steps.build-package.outcome }}
+          TEST_OUTCOME: ${{ steps.run-tests.outcome }}
+        run: |
+          outcome() {
+            case "${1:-}" in
+              success) printf 'Passed\n' ;;
+              failure) printf 'Failed\n' ;;
+              skipped) printf 'Skipped\n' ;;
+              cancelled) printf 'Cancelled\n' ;;
+              *) printf 'Unknown\n' ;;
+            esac
+          }
+
+          {
+            printf '### CI summary\n\n'
+            printf '| Step | Outcome |\n'
+            printf '|---|---|\n'
+            printf '| Checkout | %s\n' "$(outcome '${{ steps.checkout.outcome }}')"
+            printf '| Go setup | %s\n' "$(outcome '${{ steps.setup-go.outcome }}')"
+            printf '| Install dependencies | %s\n' "$(outcome '${{ steps.install-dependencies.outcome }}')"
+            printf '| Check formatting | %s\n' "$(outcome "${CHECK_FORMATTING_OUTCOME}")"
+            printf '| Run lint checks | %s\n' "$(outcome "${LINT_OUTCOME}")"
+            printf '| Build package | %s\n' "$(outcome "${BUILD_OUTCOME}")"
+            printf '| Run tests | %s\n' "$(outcome "${TEST_OUTCOME}")"
+          } >> "$GITHUB_STEP_SUMMARY"
