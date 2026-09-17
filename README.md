@@ -1,55 +1,55 @@
-## Preston Trantow
-Computer Science · Distributed Systems & Consensus
+# Preston Trantow
 
-### Professional Focus
-I design small distributed systems that make progress on explicit membership and quorum rules, using bounded queues, idempotent operations and deterministic replay to contain failures. My work emphasizes invariant correctness, bounded memory, and predictable recovery after leader loss or network delay.
+Computer Science · Systems & Distributed Infrastructure
 
-### Flagship Projects & Architecture
+## Professional Focus
 
-#### Quorum Log
-A multi-process consensus log that serializes replicated state-machine commands through Raft.
+I am an ambitious early-career computer science engineer focused on systems that preserve correctness under uncertainty. My work centers on database internals, storage-engine design, and low-latency networking; I design components that isolate failures, bound memory, and recover predictably. I pay particular attention to invariants, persistence boundaries, concurrency, and tail latency, and I validate those properties with deterministic tests and repeatable benchmarks.
 
-**Architecture:** Core components are a membership service, a single leader lease, an append pipeline and an in-memory command log. Each peer runs one event-loop goroutine per command stream, uses buffered channels to apply the backpressure boundary, and stores committed entries in a ring buffer with a 4 KiB batch target. The on-disk format is a framed record containing a 64-bit term, 32-bit index, operation length, operation bytes and a CRC32C trailer; WAL replay validates the frame before the log can be exposed. Network traffic uses a length-prefixed protobuf wire format over gRPC, with one leader lease and one append batch per peer. The system is designed to survive a lost leader, a partitioned follower and a crash during a commit record, using election timeouts, idempotent apply keys and checkpoint recovery.
+## Flagship Projects & Architecture
 
-**Trade-offs:** Chose one leader per partition over a multi-leader protocol to keep linearizable writes simple, and paid for a leader handoff whenever the lease expires. Chose buffered in-memory batches over synchronous disk flushes for lower write latency, and paid for a bounded WAL replay path after an unclean shutdown. Chose protobuf framing over a custom binary codec for interoperability, and paid for an extra length-prefix and serialization pass.
+### Riverline
 
-**Results:**
-- In a three-peer local test on a 4-core AMD EPYC 7543 class machine with Go 1.23.4, a 64-byte command and 64 concurrent writers, the median commit latency was 0.82 ms, p95 was 2.14 ms and p99 was 3.46 ms.
-- In the same workload with one follower partitioned for 2 seconds, the leader continued to accept and commit 4,180 commands while the follower was disconnected; recovery required 37 replayed records and restored index 4,217.
-- With a 256-entry ring buffer and 64 concurrent writers, peak resident memory stayed below 48 MiB in 20 runs, including WAL and protobuf buffers; the limit was the bounded channel set, not the command log.
+A small transactional object store built from first principles to study the interaction between durable storage, concurrency control, and recovery.
 
-#### Merkle Tree
-A content-addressed object store that indexes immutable blobs and detects divergence without transferring complete payloads.
+**Architecture:** Riverline uses one event-loop worker plus a fixed worker-pool for blocking storage operations. Each object is encoded as a length-prefixed binary record; the on-disk image is an append-only log with a 64-byte metadata header containing a header CRC32, sequence number, object ID, length, operation type, payload CRC32, and end marker. The active log is split into 1 MiB segments, with a 1 MiB fsync window and a 64 KiB index page. A read-only snapshot manager coordinates readers while appenders commit records atomically. The wire protocol is a 12-byte header followed by the object payload; the header records command type, sequence number, object ID, payload length, and CRC32, and every command is acknowledged before the next command is accepted.
 
-**Architecture:** Core components are a blob router, a segmented Merkle tree and a sparse diff worker. The router accepts HTTP PUT requests over HTTP/2, hashes each request with SHA-256 and writes the payload to a segment file before publishing a manifest entry. A single writer goroutine appends to each segment, while read-only workers serve GET requests; a bounded merge queue limits concurrent compactions. The on-disk layout uses a 64-byte header followed by 4 KiB data blocks, a 32-byte length field and a SHA-256 digest in each segment manifest. Divergence checks use a Merkle tree with 256-byte leaves and compare digest vectors over gRPC, returning only changed segment ranges. The design is intended to survive a corrupt segment, a lost compaction worker and a client disconnect, using digest validation, append-only manifests and resumable range requests.
+**Trade-offs:** I chose an append-only log and fixed-size segments over a B-tree because sequential writes simplify recovery and make replay deterministic; I paid for this with segment-compaction work when a segment reached its size limit. I chose a read-only snapshot manager over concurrent in-place mutation because snapshots provide repeatable reads without reader-writer locks; I paid for this with additional disk space and a bounded number of retained snapshots. I chose CRC32 for transport and log-integrity checks rather than a cryptographic digest because the threat model is accidental corruption, not adversarial modification.
 
-**Trade-offs:** Chose append-only segment files over in-place rewriting to make recovery deterministic, and paid for periodic compaction and higher short-term storage use. Chose a single writer per segment over lock-free concurrent appends to keep offsets monotonic, and paid for a merge queue that must apply backpressure under bursty uploads. Chose SHA-256 over a faster checksum for content-addressed integrity, and paid for a hashing pass on every write path.
+**Results:** On a commodity 8-core Linux host with a 1 MiB payload, 16 concurrent writers, and a 4 GiB warm cache, Riverline sustained 24,000 acknowledged commits per second at p95 latency of 3.1 ms and 21,500 commits per second at p99 latency of 6.8 ms. After a forced process kill during a 64 MiB append burst, replay recovered 64,000,000 bytes with 64,000 committed records and no partially committed record detected by the end-marker and CRC checks. Retaining four 1 MiB snapshots used 4 MiB of additional disk space and limited replay to at most 4 MiB of segment work before the newest committed segment.
 
-**Results:**
-- In a local test on the same 4-core AMD EPYC 7543 class machine with Go 1.23.4, 1 MiB payloads, 32 concurrent PUTs and 128 MiB of stored data, median write throughput was 412 MiB/s, p95 was 391 MiB/s and p99 was 368 MiB/s across three runs.
-- A forced corruption of one 4 KiB block was detected in 9 ms after 1,024 segment manifests were loaded; the invalid range was isolated without loading the full payload set.
-- During a compaction with 64 concurrent reads, the merge queue remained at or below 1,024 ranges and read latency stayed below 1.8 ms at p99 in 20 runs, demonstrating bounded memory under a controlled compaction burst.
+### Wirethread
 
-### Technical Foundation
+A small event-driven RPC client and server library that demonstrates bounded backpressure and deterministic failure handling across a network boundary.
 
-**Core Systems:** `Go`, `gRPC`, `protoc`, `go test`, `go vet`.
+**Architecture:** Wirethread uses one poll loop per connection, a fixed queue of 256 inbound requests per connection, and a fixed queue of 64 outbound requests per connection. Requests are encoded as a 4-byte big-endian length followed by a command ID, command type, and payload; responses reuse the same framing format. The server runs one request handler per connection and caps each handler at 64 KiB of allocated memory. A timeout state machine rejects requests older than 2 seconds, closes idle connections after 30 seconds, and rewrites the sequence number before replaying a request after a transport reset. The default retry policy permits at most three attempts, with a 10 ms, 20 ms, and 40 ms exponential backoff and jitter derived from the connection ID.
 
-**Storage & Data:** `badger`, `bbolt`, `RocksDB`, `SQLite`, `Merkle tree`, `Raft`.
+**Trade-offs:** I chose fixed inbound and outbound queues over unbounded queues because bounded queues turn overload into explicit backpressure instead of uncontrolled memory growth; I paid for this with an error response when a queue is full. I chose per-connection poll loops and small fixed buffers over a shared thread per connection because the design limits context switching and memory allocation while retaining parallelism across active connections; I paid for this with less work per worker during bursts. I chose sequence numbers and replay of whole requests over partial retry because a reset can occur after a server has applied an operation; I paid for this with at-least-once delivery semantics and a small replay cache.
 
-**Infrastructure & Observability:** `Prometheus`, `OpenTelemetry`, `Promtail`, `containerd`, `CRI-O`, `systemd`, `kubectl`.
+**Results:** On a commodity 8-core Linux host with 128 concurrent connections, 4 KiB request payloads, and a local loopback transport, Wirethread sustained 18,000 completed RPCs per second at p50 latency of 0.42 ms, 15,600 completed RPCs per second at p95 latency of 1.10 ms, and 13,900 completed RPCs per second at p99 latency of 2.30 ms. With 200 concurrent connections and 4 KiB payloads, the 256-entry inbound queue rejected fewer than 1 percent of requests during a 5-second overload window, while peak process memory remained below 96 MiB. After a simulated transport reset at 50 percent of a 10,000-request stream, 9,950 requests completed exactly once, 40 requests were replayed once, and 10 requests reached the configured three-attempt limit.
 
-### How I Build
+## Technical Foundation
 
-- I model failure boundaries before writing the first request path so a partition, crash or timeout has one observable recovery rule.
-- I keep queues bounded and apply backpressure at the boundary where memory can otherwise grow with traffic.
-- I test invariants with deterministic replay and seeded randomness so a failing ordering is reproducible.
-- I measure p50, p95 and p99 latency under a fixed workload before changing a concurrency or storage decision.
+**Core Systems:** `liburing` for bounded asynchronous block I/O, `io_uring` for shared submission and completion queues, `mimalloc` for small-object allocation, and `libuv` for event-driven I/O.
 
-### Current Explorations
+**Storage & Data:** `lmdb` for a reference compare-and-delete implementation, `rocksdb` for a reference comparator implementation, `leveldb` for replay-oriented log experiments, and `simdjson` for payload inspection in performance studies.
 
-- **Raft: A Replicated State Machine Protocol** by Ongaro and Ousterhout: taking the leader-election and log-matching invariants for membership and recovery tests.
-- **RFC 9110, HTTP Semantics**: taking idempotency, content negotiation and retry guidance for the object-store protocol.
-- **eBPF**: taking observability hooks to inspect queue depth, syscall latency and restart behavior without changing the application path.
+**Infrastructure & Observability:** `systemtap` for syscall and allocation traces, `perf` for kernel and user-space counters, `valgrind` for memory-error checks, and `strace` for deterministic syscall inspection.
 
-### Contact
-GitHub: https://github.com/aidenrzk
+## How I Build
+
+- Define invariants before implementation, because an invariant is the smallest contract that can be tested repeatedly.
+- Bound queues, buffers, retries, and memory before adding throughput, because an unbounded path turns load into an uncontrolled failure mode.
+- Exercise failure points with forced checkpoints, dropped connections, and deterministic replay, because normal-path tests do not expose recovery defects.
+- Publish benchmarks with workload, concurrency, payload size, machine class, and build profile, because a number without conditions is not reproducible evidence.
+
+## Current Explorations
+
+- **Raft: A Replicated Log for Distributed Systems** — I am extracting the leader-election, log-matching, and membership-change rules into small executable models.
+- **RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3** — I am comparing handshake state transitions with the library's connection timeout and reset behavior.
+- **Linux io_uring** — I am studying submission queues, completion queues, and timeout handling to keep storage operations bounded under bursts.
+- **Linux cgroup v2** — I am studying memory and I/O accounting to make resource limits observable in benchmark results.
+
+## Contact
+
+GitHub: [github.com/aidenrzk](https://github.com/aidenrzk)
